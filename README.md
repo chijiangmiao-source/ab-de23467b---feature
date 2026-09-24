@@ -1,8 +1,10 @@
 # calibsvc — 晶圆量测设备标定参数服务
 
-按设备维护随批次区间（半开区间 `[lower, upper)`）变化的标定参数。每次发布生成一个
-递增修订号，新区间只替换上一修订的重叠部分，保留左右残段并合并内容相同的相邻段；
-所有历史修订不可变、可随时复算。
+按设备维护随批次区间（半开区间 `[lower, upper)`）变化的标定参数，并允许在特定批次与
+温度组合上发布温区覆盖层（半开批次区间 × 半开温度区间的矩形）。每次发布（无论基础
+标定还是温区）生成同一个递增修订号，新区间/矩形只替换上一修订的重叠部分，保留残段
+并合并内容相同且共享完整边界的相邻区域；未命中温区的温度回退到基础批次标定。所有
+历史修订不可变、可随时复算。
 
 ## 快速开始
 
@@ -59,7 +61,7 @@ POST /v1/equipments/{equipment}/calibrations
 ### 查询生效标定
 
 ```
-GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
+GET /v1/equipments/{equipment}/calibration?batch=75[&temperature=25][&revision=2]
 
 → 200
 {
@@ -74,13 +76,57 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 `revision` 省略时查当前最新修订；指定时复算该历史修订当时唯一生效的内容、
 区间边界与修订号。历史修订只增不改，任何时刻都可复算。
 
+**省略 `temperature`（一维查询，语义不变）**：只查基础批次标定，响应体中不含
+`temperature`/`source`/`temp_lower`/`temp_upper` 字段。
+
+**带上 `temperature`（二维查询）**：先查温区覆盖层；命中时返回
+`"source":"zone"`、`"temperature":T` 与命中矩形的
+`temp_lower`/`temp_upper`。未命中任何温区（或该温度不在覆盖温区内）时回退到
+基础批次标定，返回 `"source":"base"` 且不带温度区间；基础标定也不覆盖该批次时
+仍是 `404 BATCH_NOT_COVERED`。
+
+### 发布温区覆盖层
+
+```
+POST /v1/equipments/{equipment}/temperature-zones
+{
+  "operation_id":  "op-2026-tz-01",  // 操作标识（幂等键，设备内全局唯一，跨入口亦然）
+  "seen_revision": 4,                // 调用方所见修订号（乐观并发控制）
+  "batch_lower": 50, "batch_upper": 150,   // 半开批次区间 [batch_lower, batch_upper)
+  "temp_lower":  20, "temp_upper":  30,    // 半开温度区间 [temp_lower, temp_upper)
+  "content": { "recipe": "R1-T", "gain": 1.6 }   // 任意 JSON 标定内容
+}
+
+→ 201
+{
+  "equipment": "EQ-1",
+  "revision": 5,                     // 与基础发布共用同一递增修订号
+  "zones": [                         // 该修订生效的完整温区矩形快照
+    {"batch_lower":0,"batch_upper":50, "temp_lower":20,"temp_upper":30,"content":{...}},
+    {"batch_lower":50,"batch_upper":150,"temp_lower":20,"temp_upper":30,"content":{...}},
+    ...
+  ]
+}
+```
+
+- 新矩形把与之重叠的当前矩形沿批次/温度边界精确切分为互不重叠的矩形，只替换
+  重叠区域，保留其余残段；随后合并内容相同且**共享完整边界**（另一轴区间完全
+  一致）的相邻矩形，链式合并会反复进行直到不能再合并。
+- 温区发布同样校验 `seen_revision`、支持幂等重放与 `X-Idempotent-Replay`，
+  规则与基础发布完全一致；两类发布共用同一个幂等账本与修订号，互发仍会推进
+  head，操作标识在两个入口之间也不能复用。
+- 每次发布（无论哪一类）生成的新修订都同时包含当时**完整的基础批次标定快照**
+  与**全部温区覆盖层快照**，因此按 `(batch, temperature, revision)` 复算永远
+  得到唯一内容。
+- 温度区间或批次区间非法（下界 ≥ 上界）返回 `400 INVALID_INTERVAL`。
+
 ### 错误码（稳定）
 
 | HTTP | code                  | 含义                                   |
 |------|-----------------------|----------------------------------------|
 | 400  | `INVALID_JSON`        | 请求体不是合法 JSON / 含未知字段       |
 | 400  | `INVALID_PARAMETER`   | 缺少必填参数或参数非法                 |
-| 400  | `INVALID_INTERVAL`    | 区间非法（`lower >= upper`）           |
+| 400  | `INVALID_INTERVAL`    | 区间非法（`lower >= upper`，含温区的批次/温度轴） |
 | 400  | `INVALID_CONTENT`     | content 不是合法 JSON                  |
 | 404  | `EQUIPMENT_NOT_FOUND` | 设备不存在                             |
 | 404  | `REVISION_NOT_FOUND`  | 修订号不存在（超出当前修订）           |
@@ -93,27 +139,43 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 
 **数据模型**（PostgreSQL，`internal/store`）
 
-- `heads(equipment, revision)`：每台设备的当前修订号。
-- `segments(equipment, revision, lower, upper, content)`：每个修订的完整区间
-  快照，只插不改不删——数据库触发器拒绝任何 `UPDATE`/`DELETE`，历史修订永远
-  可复算。
+- `heads(equipment, revision)`：每台设备的当前修订号，两类发布共用。
+- `segments(equipment, revision, lower, upper, content)`：每个修订的完整基础
+  批次区间快照，只插不改不删。
+- `temperature_zones(equipment, revision, batch_lower, batch_upper, temp_lower,
+  temp_upper, content)`：每个修订的完整温区矩形快照，同样只插不改不删。
+  **每个修订都同时写满两层快照**：基础发布把当前温区快照复制到新修订，温区
+  发布把当前基础快照复制到新修订。
 - `operations(equipment, operation_id, request_hash, revision, response)`：
-  幂等账本，记录首次响应，同样受不可变触发器保护。
+  幂等账本，两类发布共用同一命名空间（请求哈希含入口类型前缀），记录首次响应，
+  受不可变触发器保护；`segments`、`temperature_zones`、`operations` 三张表的
+  `UPDATE`/`DELETE` 均被数据库触发器拒绝。
 
 **发布事务**（单事务，失败即整体回滚，不留部分切分）
 
 1. `INSERT ... ON CONFLICT DO NOTHING` 建 head 行，随后 `SELECT ... FOR UPDATE`
-   锁定——同一设备的发布由此串行化。
-2. 先查幂等账本：同操作同参数 → 直接重放首次结果；同操作异参数 →
-   `OPERATION_CONFLICT`。（先于修订检查，保证过期修订的合法重试仍返回首次结果。）
+   锁定——同一设备的两类发布由此串行化。
+2. 先查幂等账本：同操作同参数 → 直接重放首次结果；同操作异参数（含跨入口
+   复用）→ `OPERATION_CONFLICT`。（先于修订检查，保证过期修订的合法重试仍
+   返回首次结果。）
 3. 校验 `seen_revision == head`，否则 `STALE_REVISION`。
-4. 读取当前修订区间，用 `internal/split.Apply` 计算新快照（替换重叠、保留
-   残段、合并同内容相邻段），整批写入新修订并推进 head，记录幂等账本，提交。
+4. 基础发布读取当前 `segments` 用 `internal/split.Apply` 计算新快照，温区层
+   原样复制；温区发布读取当前 `temperature_zones` 用
+   `internal/split2d.Apply` 计算新快照，基础层原样复制。整批写入新修订、
+   推进 head、记录幂等账本，提交。
 
 **区间切分**（`internal/split`，纯函数，表驱动单元测试覆盖）
 
 新区间 `[L,U)` 作用于有序不重叠段集：重叠段留下 `[s.L,L)` 与 `[U,s.U)` 残段，
 中段被新段替换，最后对相邻同内容段做合并；输出保持有序、不重叠、无退化段。
+
+**矩形切分**（`internal/split2d`，纯函数，表驱动单元测试覆盖）
+
+以新矩形 `[bL,bU)×[tL,tU)` 与全部既有矩形的批次/温度边界建立网格：网格中落在
+新矩形内的单元内容被替换，其余单元保留唯一覆盖它的既有矩形内容（十字切分时
+保留 8 邻域残段）。随后只合并内容相同且共享**完整边界**的矩形对——批次相邻
+要求温度区间完全一致，温度相邻要求批次区间完全一致；部分重叠的边不合并。
+合并反复迭代以消除链式可合并区域。输出有序、两两不重叠、无退化矩形。
 
 ## 验证（compose 中的 verify 服务）
 
@@ -123,10 +185,18 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 - 单元测试：`go test ./...`（区间切分、JSON 规范化）
 - HTTP 冒烟（对运行中的服务）：
   - 区间切分与覆盖：中间批次补发、残段保留、同内容合并、未覆盖批次报错
-  - 历史不变：旧修订查询结果不随后续发布改变（API 层 + 数据库触发器层）
-  - 幂等重放：同操作同内容（含并发）返回首次结果，异参复用报 `OPERATION_CONFLICT`
+  - 温区十字切分：十字打孔 8 邻域残段保留、重叠区替换、沿两轴的同内容
+    相邻矩形合并（含链式合并）
+  - 边界温度回退基础标定：温区上界之外、温区之间、批次轴外等未命中点
+  - 历史二维复算：旧修订的 `(batch, temperature)` 结果不随后续切分/合并改变；
+    基础发布保留全部温区快照、温区发布保留基础快照；未来修订报错
+  - 历史不变：旧修订查询结果不随后续发布改变（API 层 + 数据库触发器层，
+    含 `temperature_zones` 表的 UPDATE/DELETE 拒绝）
+  - 幂等重放：同操作同内容（含并发）返回首次结果，异参/跨入口复用报
+    `OPERATION_CONFLICT`
   - 并发过期冲突：8 个并发发布同一所见修订，恰好 1 个成功、其余
-    `STALE_REVISION`，head 恰好前进 1
+    `STALE_REVISION`，head 恰好前进 1；两类入口混合同所见修订亦然
+  - 既有一维接口回归：不带 `temperature` 的发布与查询行为、响应形态完全不变
   - 参数校验与稳定错误码；失败事务不留任何状态
 
 ## 配置
@@ -143,9 +213,10 @@ GET /v1/equipments/{equipment}/calibration?batch=75[&revision=2]
 ```
 cmd/server/        服务入口（健康路径、优雅退出）
 cmd/verify/        一次性验收：构建检查 + 单元测试 + HTTP 冒烟
-internal/split/    区间切分纯函数（单元测试）
+internal/split/    一维区间切分纯函数（单元测试）
+internal/split2d/  二维批次×温度矩形切分与合并纯函数（单元测试）
 internal/canonjson/ JSON 规范化（内容相等性）
-internal/store/    PostgreSQL 持久化与发布事务
+internal/store/    PostgreSQL 持久化与两类发布事务
 internal/httpapi/  HTTP 路由、参数校验、错误映射
 Dockerfile         runtime（服务）与 verify（验收）两个构建目标
 docker-compose.yml db + app + verify 编排，健康依赖与可配置端口
