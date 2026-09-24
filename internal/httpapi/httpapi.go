@@ -2,7 +2,8 @@
 //
 //	GET  /health
 //	POST /v1/equipments/{equipment}/calibrations
-//	GET  /v1/equipments/{equipment}/calibration?batch=N[&revision=R]
+//	POST /v1/equipments/{equipment}/temperature-overlays
+//	GET  /v1/equipments/{equipment}/calibration?batch=N[&temperature=T][&revision=R]
 //
 // Errors are reported as {"error":{"code","message"}} with stable codes.
 package httpapi
@@ -34,6 +35,7 @@ func New(st *store.Store) *Server {
 	s := &Server{st: st, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/equipments/{equipment}/calibrations", s.handlePublish)
+	s.mux.HandleFunc("POST /v1/equipments/{equipment}/temperature-overlays", s.handlePublishOverlay)
 	s.mux.HandleFunc("GET /v1/equipments/{equipment}/calibration", s.handleQuery)
 	return s
 }
@@ -59,31 +61,28 @@ type publishRequest struct {
 	Content      json.RawMessage `json:"content"`
 }
 
+// overlayRequest is a temperature-overlay publish: a half-open batch interval
+// crossed with a half-open temperature interval, forming one rectangle.
+type overlayRequest struct {
+	OperationID  *string         `json:"operation_id"`
+	SeenRevision *int64          `json:"seen_revision"`
+	BatchLower   *int64          `json:"batch_lower"`
+	BatchUpper   *int64          `json:"batch_upper"`
+	TempLower    *int64          `json:"temp_lower"`
+	TempUpper    *int64          `json:"temp_upper"`
+	Content      json.RawMessage `json:"content"`
+}
+
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	equipment := r.PathValue("equipment")
 
 	var req publishRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body is not valid JSON: "+err.Error())
-		return
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body must contain a single JSON document")
+	if !decodeRequest(w, r, &req) {
 		return
 	}
 
-	if req.OperationID == nil || *req.OperationID == "" {
-		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "operation_id is required")
-		return
-	}
-	if req.SeenRevision == nil {
-		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "seen_revision is required")
-		return
-	}
-	if *req.SeenRevision < 0 {
-		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "seen_revision must be >= 0")
+	if err := validateOperation(req.OperationID, req.SeenRevision); err != nil {
+		writeValidationError(w, err)
 		return
 	}
 	if req.Lower == nil {
@@ -98,13 +97,8 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_INTERVAL", "lower must be less than upper")
 		return
 	}
-	if req.Content == nil {
-		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "content is required")
-		return
-	}
-	content, err := canonjson.Normalize(req.Content)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_CONTENT", "content is not valid JSON: "+err.Error())
+	content, ok := normalizeContent(w, req.Content)
+	if !ok {
 		return
 	}
 
@@ -115,14 +109,131 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		Lower:        *req.Lower,
 		Upper:        *req.Upper,
 		Content:      content,
-		RequestHash: requestHash(equipment, *req.OperationID, *req.SeenRevision,
+		RequestHash: baseRequestHash(equipment, *req.OperationID, *req.SeenRevision,
 			*req.Lower, *req.Upper, content),
 	})
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
+	writePublishResult(w, res)
+}
 
+func (s *Server) handlePublishOverlay(w http.ResponseWriter, r *http.Request) {
+	equipment := r.PathValue("equipment")
+
+	var req overlayRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+
+	if err := validateOperation(req.OperationID, req.SeenRevision); err != nil {
+		writeValidationError(w, err)
+		return
+	}
+	switch {
+	case req.BatchLower == nil:
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "batch_lower is required")
+		return
+	case req.BatchUpper == nil:
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "batch_upper is required")
+		return
+	case req.TempLower == nil:
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "temp_lower is required")
+		return
+	case req.TempUpper == nil:
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "temp_upper is required")
+		return
+	}
+	if *req.BatchLower >= *req.BatchUpper {
+		writeError(w, http.StatusBadRequest, "INVALID_INTERVAL", "batch_lower must be less than batch_upper")
+		return
+	}
+	if *req.TempLower >= *req.TempUpper {
+		writeError(w, http.StatusBadRequest, "INVALID_INTERVAL", "temp_lower must be less than temp_upper")
+		return
+	}
+	content, ok := normalizeContent(w, req.Content)
+	if !ok {
+		return
+	}
+
+	res, err := s.st.PublishOverlay(r.Context(), store.OverlayParams{
+		Equipment:    equipment,
+		OperationID:  *req.OperationID,
+		SeenRevision: *req.SeenRevision,
+		BatchLo:      *req.BatchLower,
+		BatchHi:      *req.BatchUpper,
+		TempLo:       *req.TempLower,
+		TempHi:       *req.TempUpper,
+		Content:      content,
+		RequestHash: overlayRequestHash(equipment, *req.OperationID, *req.SeenRevision,
+			*req.BatchLower, *req.BatchUpper, *req.TempLower, *req.TempUpper, content),
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writePublishResult(w, res)
+}
+
+type validationError struct {
+	code    string
+	message string
+}
+
+func (e *validationError) Error() string { return e.message }
+
+func validateOperation(operationID *string, seenRevision *int64) error {
+	switch {
+	case operationID == nil || *operationID == "":
+		return &validationError{"INVALID_PARAMETER", "operation_id is required"}
+	case seenRevision == nil:
+		return &validationError{"INVALID_PARAMETER", "seen_revision is required"}
+	case *seenRevision < 0:
+		return &validationError{"INVALID_PARAMETER", "seen_revision must be >= 0"}
+	}
+	return nil
+}
+
+func writeValidationError(w http.ResponseWriter, err error) {
+	var ve *validationError
+	if errors.As(err, &ve) {
+		writeError(w, http.StatusBadRequest, ve.code, ve.message)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
+}
+
+// decodeRequest decodes one strict JSON document (unknown fields rejected).
+func decodeRequest(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body is not valid JSON: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "request body must contain a single JSON document")
+		return false
+	}
+	return true
+}
+
+func normalizeContent(w http.ResponseWriter, raw json.RawMessage) (string, bool) {
+	if raw == nil {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "content is required")
+		return "", false
+	}
+	content, err := canonjson.Normalize(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_CONTENT", "content is not valid JSON: "+err.Error())
+		return "", false
+	}
+	return content, true
+}
+
+func writePublishResult(w http.ResponseWriter, res *store.PublishResult) {
 	w.Header().Set("Content-Type", "application/json")
 	if res.Replayed {
 		w.Header().Set("X-Idempotent-Replay", "true")
@@ -160,6 +271,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		revision = &rev
 	}
 
+	// temperature is optional: omitting it keeps the original one-dimensional
+	// query semantics and response shape exactly as before.
+	if tempRaw := q.Get("temperature"); tempRaw != "" {
+		temperature, err := strconv.ParseInt(tempRaw, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_PARAMETER", "temperature must be an integer")
+			return
+		}
+		s.handleQuery2D(w, r, equipment, batch, temperature, revision)
+		return
+	}
+
 	res, err := s.st.Query(r.Context(), equipment, batch, revision)
 	if err != nil {
 		writeStoreError(w, err)
@@ -184,12 +307,57 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
+func (s *Server) handleQuery2D(w http.ResponseWriter, r *http.Request, equipment string, batch, temperature int64, revision *int64) {
+	res, err := s.st.Query2D(r.Context(), equipment, batch, temperature, revision)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+
+	body, _ := json.Marshal(struct {
+		Equipment   string          `json:"equipment"`
+		Batch       int64           `json:"batch"`
+		Temperature int64           `json:"temperature"`
+		Revision    int64           `json:"revision"`
+		Source      string          `json:"source"`
+		Lower       int64           `json:"lower"`
+		Upper       int64           `json:"upper"`
+		TempLower   int64           `json:"temp_lower"`
+		TempUpper   int64           `json:"temp_upper"`
+		Content     json.RawMessage `json:"content"`
+	}{
+		Equipment:   res.Equipment,
+		Batch:       res.Batch,
+		Temperature: res.Temperature,
+		Revision:    res.Revision,
+		Source:      res.Source,
+		Lower:       res.Lower,
+		Upper:       res.Upper,
+		// Rectangles carry their temperature span; base fallbacks omit it.
+		TempLower: res.TempLower,
+		TempUpper: res.TempUpper,
+		Content:   json.RawMessage(res.Content),
+	})
+	writeJSON(w, http.StatusOK, body)
+}
+
 // requestHash binds an operation id to its full parameter set so that reused
-// ids with different parameters are detected deterministically.
-func requestHash(equipment, operationID string, seenRevision, lower, upper int64, content string) string {
+// ids with different parameters are detected deterministically. The base
+// format is kept byte-identical to the original one-dimensional service for
+// upgrade compatibility; cross-endpoint operation-id reuse is rejected via
+// the kind column in the ledger, and the overlay format has a distinct field
+// count.
+func baseRequestHash(equipment, operationID string, seenRevision, lower, upper int64, content string) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%d\x00%s",
 		equipment, operationID, seenRevision, lower, upper, content)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func overlayRequestHash(equipment, operationID string, seenRevision, bl, bh, tl, th int64, content string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "overlay\x00%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s",
+		equipment, operationID, seenRevision, bl, bh, tl, th, content)
 	return hex.EncodeToString(h.Sum(nil))
 }
 

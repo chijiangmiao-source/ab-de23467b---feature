@@ -39,8 +39,10 @@ var (
 	opSeq  atomic.Int64
 	failed atomic.Int32
 
-	// splitEq carries state between the splitting and history scenarios.
-	splitEq string
+	// splitEq/overlayEq carry state between the publishing and history
+	// scenarios.
+	splitEq   string
+	overlayEq string
 )
 
 func main() {
@@ -57,6 +59,10 @@ func main() {
 	step("HTTP smoke: idempotent replay and operation conflict", scenarioIdempotency)
 	step("HTTP smoke: concurrent stale-revision conflict", scenarioConcurrency)
 	step("HTTP smoke: validation and stable errors", scenarioValidation)
+	step("HTTP smoke: overlay cross split and temperature fallback", scenarioOverlayCross)
+	step("HTTP smoke: overlay adjacent-rectangle merge", scenarioOverlayMerge)
+	step("HTTP smoke: overlay historical 2D queries", scenarioOverlayHistory)
+	step("HTTP smoke: overlay idempotency, cross-kind conflict, concurrency", scenarioOverlayIdem)
 	if dbURL != "" {
 		step("history immutability enforced by database", scenarioDBImmutability)
 	}
@@ -680,5 +686,520 @@ func scenarioDBImmutability() error {
 		`UPDATE operations SET response = '{}' WHERE equipment = $1`, splitEq); err == nil {
 		return fmt.Errorf("UPDATE on operation ledger succeeded, want immutability error")
 	}
+
+	// Temperature overlay snapshots are equally immutable.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE overlay_rects SET content = '"HACKED"' WHERE equipment = $1`, overlayEq); err == nil {
+		return fmt.Errorf("UPDATE on historical overlay_rects succeeded, want immutability error")
+	} else if !strings.Contains(err.Error(), "immutable") {
+		return fmt.Errorf("overlay UPDATE rejected with unexpected error: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM overlay_rects WHERE equipment = $1`, overlayEq); err == nil {
+		return fmt.Errorf("DELETE on historical overlay_rects succeeded, want immutability error")
+	} else if !strings.Contains(err.Error(), "immutable") {
+		return fmt.Errorf("overlay DELETE rejected with unexpected error: %v", err)
+	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Temperature overlay support
+// ---------------------------------------------------------------------------
+
+type rect struct {
+	BatchLower int64           `json:"batch_lower"`
+	BatchUpper int64           `json:"batch_upper"`
+	TempLower  int64           `json:"temp_lower"`
+	TempUpper  int64           `json:"temp_upper"`
+	Content    json.RawMessage `json:"content"`
+}
+
+type overlayPublishResponse struct {
+	Equipment  string `json:"equipment"`
+	Revision   int64  `json:"revision"`
+	Rectangles []rect `json:"rectangles"`
+}
+
+type query2DResponse struct {
+	Equipment   string          `json:"equipment"`
+	Batch       int64           `json:"batch"`
+	Temperature int64           `json:"temperature"`
+	Revision    int64           `json:"revision"`
+	Source      string          `json:"source"`
+	Lower       int64           `json:"lower"`
+	Upper       int64           `json:"upper"`
+	TempLower   int64           `json:"temp_lower"`
+	TempUpper   int64           `json:"temp_upper"`
+	Content     json.RawMessage `json:"content"`
+}
+
+func rectJSON(bl, bh, tl, th int64, content string) rect {
+	return rect{BatchLower: bl, BatchUpper: bh, TempLower: tl, TempUpper: th, Content: json.RawMessage(content)}
+}
+
+func publishOverlay(eq, op string, seen, bl, bh, tl, th int64, content string) (int, []byte, error) {
+	body := fmt.Sprintf(
+		`{"operation_id":%q,"seen_revision":%d,"batch_lower":%d,"batch_upper":%d,`+
+			`"temp_lower":%d,"temp_upper":%d,"content":%s}`,
+		op, seen, bl, bh, tl, th, content)
+	return doJSON(http.MethodPost,
+		fmt.Sprintf("%s/v1/equipments/%s/temperature-overlays", appURL, url.PathEscape(eq)), body)
+}
+
+func publishOverlayRaw(eq, body string) (int, []byte, error) {
+	return doJSON(http.MethodPost,
+		fmt.Sprintf("%s/v1/equipments/%s/temperature-overlays", appURL, url.PathEscape(eq)), body)
+}
+
+func query2D(eq string, batch, temperature int64, revision string) (int, []byte, error) {
+	u := fmt.Sprintf("%s/v1/equipments/%s/calibration?batch=%d&temperature=%d",
+		appURL, url.PathEscape(eq), batch, temperature)
+	if revision != "" {
+		u += "&revision=" + revision
+	}
+	return doJSON(http.MethodGet, u, "")
+}
+
+func expectRects(got, want []rect) error {
+	if len(got) != len(want) {
+		return fmt.Errorf("rectangles = %s, want %s", mustJSON(got), mustJSON(want))
+	}
+	for i := range want {
+		if got[i].BatchLower != want[i].BatchLower ||
+			got[i].BatchUpper != want[i].BatchUpper ||
+			got[i].TempLower != want[i].TempLower ||
+			got[i].TempUpper != want[i].TempUpper ||
+			string(got[i].Content) != string(want[i].Content) {
+			return fmt.Errorf("rectangles = %s, want %s", mustJSON(got), mustJSON(want))
+		}
+	}
+	return nil
+}
+
+func expectOverlayPublish(eq, op string, seen, bl, bh, tl, th int64, content string, wantRev int64, want ...rect) error {
+	st, body, err := publishOverlay(eq, op, seen, bl, bh, tl, th, content)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("overlay publish %s: status %d, want 201 (body %s)", op, st, body)
+	}
+	var pr overlayPublishResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return fmt.Errorf("overlay publish %s: response not JSON: %v (%s)", op, err, body)
+	}
+	if pr.Equipment != eq {
+		return fmt.Errorf("overlay publish %s: equipment = %q, want %q", op, pr.Equipment, eq)
+	}
+	if pr.Revision != wantRev {
+		return fmt.Errorf("overlay publish %s: revision = %d, want %d", op, pr.Revision, wantRev)
+	}
+	return expectRects(pr.Rectangles, want)
+}
+
+func expectQuery2D(eq string, batch, temperature int64, revision string,
+	wantRev int64, wantSource string, wantLo, wantHi, wantTL, wantTH int64, wantContent string) error {
+	st, body, err := query2D(eq, batch, temperature, revision)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusOK {
+		return fmt.Errorf("2D query %s (%d,%d) rev=%q: status %d, want 200 (body %s)",
+			eq, batch, temperature, revision, st, body)
+	}
+	var qr query2DResponse
+	if err := json.Unmarshal(body, &qr); err != nil {
+		return fmt.Errorf("2D query (%d,%d) rev=%q: response not JSON: %v (%s)",
+			batch, temperature, revision, err, body)
+	}
+	if qr.Source != wantSource || qr.Revision != wantRev ||
+		qr.Lower != wantLo || qr.Upper != wantHi ||
+		qr.TempLower != wantTL || qr.TempUpper != wantTH ||
+		string(qr.Content) != wantContent {
+		return fmt.Errorf("2D query (%d,%d) rev=%q: got source=%s rev=%d [%d,%d)x[%d,%d) %s, want source=%s rev=%d [%d,%d)x[%d,%d) %s",
+			batch, temperature, revision,
+			qr.Source, qr.Revision, qr.Lower, qr.Upper, qr.TempLower, qr.TempUpper, qr.Content,
+			wantSource, wantRev, wantLo, wantHi, wantTL, wantTH, wantContent)
+	}
+	return nil
+}
+
+// scenarioOverlayCross publishes a wide overlay band and then punches a
+// rectangle through its middle: the band must split into four residuals
+// around the new rectangle, points outside overlay bands fall back to the
+// base calibration (also at half-open boundaries), and a following base
+// publish keeps every overlay rectangle.
+func scenarioOverlayCross() error {
+	overlayEq = uniqueEq("EQ-OVL")
+	eq := overlayEq
+
+	// Base batch calibration first.
+	if err := expectPublish(eq, uniqueOp("o0"), 0, 0, 200, `"BASE"`, 1,
+		seg(0, 200, `"BASE"`)); err != nil {
+		return err
+	}
+	// Wide temperature band over all batches.
+	if err := expectOverlayPublish(eq, uniqueOp("o1"), 1, 0, 200, 0, 100, `"LO"`, 2,
+		rectJSON(0, 200, 0, 100, `"LO"`)); err != nil {
+		return err
+	}
+	// Cross: rectangle through the middle of the band.
+	if err := expectOverlayPublish(eq, uniqueOp("o2"), 2, 50, 150, 40, 60, `"X"`, 3,
+		rectJSON(0, 50, 0, 100, `"LO"`),
+		rectJSON(50, 150, 0, 40, `"LO"`),
+		rectJSON(50, 150, 40, 60, `"X"`),
+		rectJSON(50, 150, 60, 100, `"LO"`),
+		rectJSON(150, 200, 0, 100, `"LO"`),
+	); err != nil {
+		return err
+	}
+
+	// Resolve points: overlay hit, inclusive lower boundaries...
+	for _, tc := range []struct {
+		batch, temp     int64
+		lo, hi, tl, th  int64
+		source, content string
+	}{
+		{100, 50, 50, 150, 40, 60, "overlay", `"X"`},
+		{100, 40, 50, 150, 40, 60, "overlay", `"X"`}, // lower temp boundary inclusive
+		{100, 59, 50, 150, 40, 60, "overlay", `"X"`},
+		{100, 39, 50, 150, 0, 40, "overlay", `"LO"`},
+		{49, 50, 0, 50, 0, 100, "overlay", `"LO"`},
+		{150, 50, 150, 200, 0, 100, "overlay", `"LO"`},
+		{50, 0, 50, 150, 0, 40, "overlay", `"LO"`},
+		{199, 99, 150, 200, 0, 100, "overlay", `"LO"`},
+		// ...the inclusive lower edge of the high-temp residual still hits
+		// the overlay, while the half-open upper boundary / outside bands
+		// fall back to base.
+		{100, 60, 50, 150, 60, 100, "overlay", `"LO"`},
+		{100, 100, 0, 200, 0, 0, "base", `"BASE"`},
+		{0, -1, 0, 200, 0, 0, "base", `"BASE"`},
+		{100, 1 << 20, 0, 200, 0, 0, "base", `"BASE"`},
+	} {
+		if err := expectQuery2D(eq, tc.batch, tc.temp, "3", 3,
+			tc.source, tc.lo, tc.hi, tc.tl, tc.th, tc.content); err != nil {
+			return err
+		}
+	}
+	// Only a point the base does not cover either stays uncovered.
+	for _, p := range []struct{ batch, temp int64 }{{200, 50}, {-1, 50}} {
+		st, body, err := query2D(eq, p.batch, p.temp, "3")
+		if err != nil {
+			return err
+		}
+		if err := expectError(st, body, http.StatusNotFound, "BATCH_NOT_COVERED"); err != nil {
+			return fmt.Errorf("point (%d,%d): %w", p.batch, p.temp, err)
+		}
+	}
+	// One-dimensional query semantics are untouched: overlays never apply.
+	if err := expectQuery(eq, 100, "", 3, 0, 200, `"BASE"`); err != nil {
+		return err
+	}
+
+	// A following base publish must preserve the complete overlay partition.
+	if err := expectPublish(eq, uniqueOp("o3"), 3, 0, 200, `"BASE"`, 4,
+		seg(0, 200, `"BASE"`)); err != nil {
+		return err
+	}
+	if err := expectQuery2D(eq, 100, 50, "4", 4, "overlay", 50, 150, 40, 60, `"X"`); err != nil {
+		return err
+	}
+	if err := expectQuery2D(eq, 100, 60, "4", 4, "overlay", 50, 150, 60, 100, `"LO"`); err != nil {
+		return err
+	}
+	if err := expectQuery2D(eq, 100, 100, "4", 4, "base", 0, 200, 0, 0, `"BASE"`); err != nil {
+		return err
+	}
+	return expectQuery(eq, 100, "", 4, 0, 200, `"BASE"`)
+}
+
+// scenarioOverlayMerge checks that equal-content rectangles sharing a full
+// edge merge (first horizontally, then vertically), while different content
+// and partial-edge neighbours stay separate.
+func scenarioOverlayMerge() error {
+	eq := uniqueEq("EQ-OVLM")
+	if err := expectPublish(eq, uniqueOp("m0"), 0, 0, 100, `"BASE"`, 1,
+		seg(0, 100, `"BASE"`)); err != nil {
+		return err
+	}
+	if err := expectOverlayPublish(eq, uniqueOp("m1"), 1, 0, 50, 0, 100, `"A"`, 2,
+		rectJSON(0, 50, 0, 100, `"A"`)); err != nil {
+		return err
+	}
+	// Horizontal full-edge neighbour with equal content: merge.
+	if err := expectOverlayPublish(eq, uniqueOp("m2"), 2, 50, 100, 0, 100, `"A"`, 3,
+		rectJSON(0, 100, 0, 100, `"A"`)); err != nil {
+		return err
+	}
+	// Vertical full-edge neighbour with equal content: merge again.
+	if err := expectOverlayPublish(eq, uniqueOp("m3"), 3, 0, 100, 100, 200, `"A"`, 4,
+		rectJSON(0, 100, 0, 200, `"A"`)); err != nil {
+		return err
+	}
+	// Different content stacked above stays its own rectangle.
+	if err := expectOverlayPublish(eq, uniqueOp("m4"), 4, 0, 100, 200, 300, `"B"`, 5,
+		rectJSON(0, 100, 0, 200, `"A"`),
+		rectJSON(0, 100, 200, 300, `"B"`),
+	); err != nil {
+		return err
+	}
+	if err := expectQuery2D(eq, 25, 199, "", 5, "overlay", 0, 100, 0, 200, `"A"`); err != nil {
+		return err
+	}
+	if err := expectQuery2D(eq, 75, 200, "", 5, "overlay", 0, 100, 200, 300, `"B"`); err != nil {
+		return err
+	}
+	// Above the overlay: base fallback.
+	return expectQuery2D(eq, 50, 300, "", 5, "base", 0, 100, 0, 0, `"BASE"`)
+}
+
+// scenarioOverlayHistory re-queries the cross scenario at earlier revisions:
+// 2D results at every past revision must recompute uniquely and stay
+// unchanged by later publishes.
+func scenarioOverlayHistory() error {
+	eq := overlayEq
+	if eq == "" {
+		return fmt.Errorf("overlay cross scenario did not run")
+	}
+	for _, tc := range []struct {
+		batch, temp    int64
+		revision       string
+		wantRev        int64
+		source         string
+		lo, hi, tl, th int64
+		content        string
+	}{
+		{100, 50, "1", 1, "base", 0, 200, 0, 0, `"BASE"`}, // no overlays yet
+		{100, 50, "2", 2, "overlay", 0, 200, 0, 100, `"LO"`},
+		{100, 39, "2", 2, "overlay", 0, 200, 0, 100, `"LO"`},
+		{100, 60, "2", 2, "overlay", 0, 200, 0, 100, `"LO"`}, // still inside the wide band before the cross
+		{100, 100, "2", 2, "base", 0, 200, 0, 0, `"BASE"`},   // half-open upper temperature boundary
+		{100, 50, "3", 3, "overlay", 50, 150, 40, 60, `"X"`},
+		{100, 60, "3", 3, "overlay", 50, 150, 60, 100, `"LO"`}, // high-temp residual
+		{100, 100, "3", 3, "base", 0, 200, 0, 0, `"BASE"`},
+		{49, 50, "3", 3, "overlay", 0, 50, 0, 100, `"LO"`},
+		{100, 50, "4", 4, "overlay", 50, 150, 40, 60, `"X"`},
+		{199, 99, "4", 4, "overlay", 150, 200, 0, 100, `"LO"`},
+	} {
+		if err := expectQuery2D(eq, tc.batch, tc.temp, tc.revision, tc.wantRev,
+			tc.source, tc.lo, tc.hi, tc.tl, tc.th, tc.content); err != nil {
+			return err
+		}
+	}
+	// Historical one-dimensional view is the base calibration at every rev.
+	if err := expectQuery(eq, 100, "2", 2, 0, 200, `"BASE"`); err != nil {
+		return err
+	}
+	if err := expectQuery(eq, 100, "4", 4, 0, 200, `"BASE"`); err != nil {
+		return err
+	}
+	// A point uncovered at an old revision stays uncovered there.
+	st, body, err := query2D(eq, 200, 50, "2")
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusNotFound, "BATCH_NOT_COVERED"); err != nil {
+		return fmt.Errorf("historical uncovered 2D point: %w", err)
+	}
+	// Revisions beyond the head do not exist in two dimensions either.
+	st, body, err = query2D(eq, 100, 50, "5")
+	if err != nil {
+		return err
+	}
+	return expectError(st, body, http.StatusNotFound, "REVISION_NOT_FOUND")
+}
+
+// scenarioOverlayIdem covers overlay idempotent replay (including concurrent
+// retries), operation-id reuse with different parameters or a different
+// publish kind, stable stale-revision rejection under concurrency, failed
+// attempts leaving no state behind, and overlay request validation.
+func scenarioOverlayIdem() error {
+	eq := uniqueEq("EQ-OVLI")
+	op := uniqueOp("oi1")
+
+	st, first, err := publishOverlay(eq, op, 0, 0, 100, 0, 100, `{"v":1}`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("first overlay publish: status %d, want 201 (body %s)", st, first)
+	}
+	// Exact retry replays the first revision/body.
+	st, replay, err := publishOverlay(eq, op, 0, 0, 100, 0, 100, `{"v": 1}`) // whitespace/key-insensitive
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated || string(replay) != string(first) {
+		return fmt.Errorf("overlay replay: status %d body %s, want 201 %s", st, replay, first)
+	}
+	// Concurrent identical retries all replay; none may create a revision.
+	const retries = 5
+	outcomes := make(chan struct {
+		st   int
+		body []byte
+		err  error
+	}, retries)
+	var wg sync.WaitGroup
+	for i := 0; i < retries; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			st, body, err := publishOverlay(eq, op, 0, 0, 100, 0, 100, `{"v":1}`)
+			outcomes <- struct {
+				st   int
+				body []byte
+				err  error
+			}{st, body, err}
+		}()
+	}
+	wg.Wait()
+	close(outcomes)
+	for o := range outcomes {
+		if o.err != nil || o.st != http.StatusCreated || string(o.body) != string(first) {
+			return fmt.Errorf("concurrent overlay retry: status %d body %s err %v", o.st, o.body, o.err)
+		}
+	}
+
+	// Same operation id, different temperature range: stable conflict.
+	st, body, err := publishOverlay(eq, op, 0, 0, 100, 0, 200, `{"v":1}`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+		return fmt.Errorf("overlay parameter reuse: %w", err)
+	}
+	// Same operation id on the base endpoint (different kind): conflict.
+	st, body, err = publish(eq, op, 0, 0, 100, `{"v":1}`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "OPERATION_CONFLICT"); err != nil {
+		return fmt.Errorf("cross-kind operation reuse: %w", err)
+	}
+
+	// Stale seen revision with a fresh operation id is rejected and leaves
+	// the head at revision 1.
+	st, body, err = publishOverlay(eq, uniqueOp("oi-stale"), 99, 0, 100, 0, 100, `"Z"`)
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusConflict, "STALE_REVISION"); err != nil {
+		return fmt.Errorf("overlay stale publish: %w", err)
+	}
+	if err := expectQuery2D(eq, 0, 50, "", 1, "overlay", 0, 100, 0, 100, `{"v":1}`); err != nil {
+		return err
+	}
+
+	// Concurrent publishes racing on the same seen revision: exactly one
+	// wins, the rest are stale; the head advances by exactly one.
+	const racers = 8
+	results := make(chan struct {
+		st   int
+		body []byte
+		err  error
+	}, racers)
+	var rwg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		rwg.Add(1)
+		go func(i int) {
+			defer rwg.Done()
+			st, body, err := publishOverlay(eq, uniqueOp(fmt.Sprintf("oi-r%d", i+1)),
+				1, int64(i*10), int64(i*10+10), 0, 100, fmt.Sprintf(`"V%d"`, i))
+			results <- struct {
+				st   int
+				body []byte
+				err  error
+			}{st, body, err}
+		}(i)
+	}
+	rwg.Wait()
+	close(results)
+	var created, staleN int
+	for o := range results {
+		switch {
+		case o.err != nil:
+			return fmt.Errorf("overlay racer failed: %w", o.err)
+		case o.st == http.StatusCreated:
+			created++
+		case o.st == http.StatusConflict && strings.Contains(string(o.body), "STALE_REVISION"):
+			staleN++
+		default:
+			return fmt.Errorf("unexpected overlay racer outcome: %d %s", o.st, o.body)
+		}
+	}
+	if created != 1 || staleN != racers-1 {
+		return fmt.Errorf("overlay race created=%d stale=%d, want 1 and %d", created, staleN, racers-1)
+	}
+	// Head is now exactly revision 2; a seen=2 publish must succeed as
+	// revision 3 (its exact snapshot still contains the racer winner, so only
+	// status and revision are asserted here; point coverage follows).
+	st, body, err = publishOverlay(eq, uniqueOp("oi-final"), 2, 0, 100, 200, 300, `"W"`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated {
+		return fmt.Errorf("post-race overlay publish: status %d, want 201 (body %s)", st, body)
+	}
+	var fr overlayPublishResponse
+	if err := json.Unmarshal(body, &fr); err != nil || fr.Revision != 3 {
+		return fmt.Errorf("post-race overlay publish revision: got %s, want revision 3", body)
+	}
+	if err := expectQuery2D(eq, 50, 250, "", 3, "overlay", 0, 100, 200, 300, `"W"`); err != nil {
+		return err
+	}
+	// The original operation still replays its first result after head moves.
+	st, replay2, err := publishOverlay(eq, op, 0, 0, 100, 0, 100, `{"v":1}`)
+	if err != nil {
+		return err
+	}
+	if st != http.StatusCreated || string(replay2) != string(first) {
+		return fmt.Errorf("overlay replay after head moved: status %d body %s, want 201 %s",
+			st, replay2, first)
+	}
+
+	// Validation: intervals, missing fields and strict JSON.
+	for _, tc := range [][4]int64{
+		{50, 50, 0, 100}, // degenerate batch interval
+		{0, 100, 80, 80}, // degenerate temperature interval
+		{0, 100, 90, 80}, // inverted temperature interval
+	} {
+		st, body, err := publishOverlay(eq, uniqueOp("oi-bad"), 0, tc[0], tc[1], tc[2], tc[3], `"X"`)
+		if err != nil {
+			return err
+		}
+		if err := expectError(st, body, http.StatusBadRequest, "INVALID_INTERVAL"); err != nil {
+			return fmt.Errorf("overlay interval %v: %w", tc, err)
+		}
+	}
+	rawCases := []struct {
+		name string
+		body string
+		code string
+	}{
+		{"missing temp bounds", `{"operation_id":"x","seen_revision":0,"batch_lower":0,"batch_upper":10,"content":"X"}`, "INVALID_PARAMETER"},
+		{"missing seen_revision", `{"operation_id":"x","batch_lower":0,"batch_upper":10,"temp_lower":0,"temp_upper":10,"content":"X"}`, "INVALID_PARAMETER"},
+		{"unknown field", `{"operation_id":"x","seen_revision":0,"batch_lower":0,"batch_upper":10,"temp_lower":0,"temp_upper":10,"content":"X","nope":1}`, "INVALID_JSON"},
+		{"malformed content", `{"operation_id":"x","seen_revision":0,"batch_lower":0,"batch_upper":10,"temp_lower":0,"temp_upper":10,"content":}`, "INVALID_JSON"},
+	}
+	for _, tc := range rawCases {
+		st, body, err := publishOverlayRaw(eq, tc.body)
+		if err != nil {
+			return err
+		}
+		if err := expectError(st, body, http.StatusBadRequest, tc.code); err != nil {
+			return fmt.Errorf("%s: %w", tc.name, err)
+		}
+	}
+	// Non-integer temperature query parameter.
+	st, body, err = doJSON(http.MethodGet,
+		fmt.Sprintf("%s/v1/equipments/%s/calibration?batch=1&temperature=warm", appURL, url.PathEscape(eq)), "")
+	if err != nil {
+		return err
+	}
+	if err := expectError(st, body, http.StatusBadRequest, "INVALID_PARAMETER"); err != nil {
+		return fmt.Errorf("non-integer temperature: %w", err)
+	}
+	// All failed attempts above must not have advanced the head (still rev 3).
+	return expectQuery2D(eq, 50, 250, "", 3, "overlay", 0, 100, 200, 300, `"W"`)
 }
